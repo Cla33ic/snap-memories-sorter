@@ -17,7 +17,7 @@
 #
 # Requirements:
 #   - macOS (uses AppleScript folder pickers)
-#   - ffmpeg in PATH  (install with:  brew install ffmpeg)
+#   - ffmpeg + ffprobe in PATH  (install with:  brew install ffmpeg — ffprobe is included)
 #
 # Usage:  chmod +x snap-memories-sorter-macos.sh && ./snap-memories-sorter-macos.sh
 
@@ -53,16 +53,17 @@ mkdir -p "$ORIG" "$MERGED"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/snap-merged.XXXXXX")" || {
   echo "Could not create a temporary working directory." >&2; exit 1; }
 MEM="$WORK/memories"
-LIST=""
-cleanup() { rm -rf "$WORK"; [ -n "$LIST" ] && rm -f "$LIST"; }
-trap cleanup EXIT
+trap 'rm -rf "$WORK"' EXIT   # one temp dir holds everything, incl. the file list
 
-# ---- locate ffmpeg -------------------------------------------------------
+# ---- locate ffmpeg + ffprobe (ffprobe ships with ffmpeg) ----------------
 FFMPEG=""
 if command -v ffmpeg >/dev/null 2>&1; then FFMPEG="$(command -v ffmpeg)"
 elif [ -x "$SCRIPT_DIR/ffmpeg" ]; then FFMPEG="$SCRIPT_DIR/ffmpeg"; fi
-if [ -z "$FFMPEG" ]; then
-  echo "ffmpeg not found. Install it:  brew install ffmpeg" >&2
+FFPROBE=""
+if command -v ffprobe >/dev/null 2>&1; then FFPROBE="$(command -v ffprobe)"
+elif [ -x "$SCRIPT_DIR/ffprobe" ]; then FFPROBE="$SCRIPT_DIR/ffprobe"; fi
+if [ -z "$FFMPEG" ] || [ -z "$FFPROBE" ]; then
+  echo "ffmpeg/ffprobe not found. Install ffmpeg (ffprobe is included):  brew install ffmpeg" >&2
   exit 1
 fi
 
@@ -97,7 +98,10 @@ find_overlay() {  # $1=dir  $2=prefix
   return 1
 }
 
-SCALE='[1:v][0:v]scale2ref[ovl][bse];[bse][ovl]overlay=0:0'
+base_dims() {  # $1=media file -> prints WxH (empty if unreadable)
+  "$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height \
+    -of csv=p=0:s=x "$1" 2>/dev/null
+}
 
 stamp() {  # $1=file $2=year $3=month $4=day
   [ "$2" != "unknown" ] && touch -t "${2}${3}${4}1200" "$1" 2>/dev/null
@@ -135,31 +139,57 @@ process_one() {
 
   # --- Merged: as seen in Snapchat ---
   local mdir="$MERGED/$year/$month"; mkdir -p "$mdir"
-  local moutext="$lext"
-  [ -n "$overlay" ] && [ "$kind" = "image" ] && moutext="jpg"
-  local mout="$mdir/$prefix.$moutext"
-  if [ -f "$mout" ]; then echo "[skip] $prefix"; return 0; fi
-  local tmp="$mout.tmp.$moutext"
+  # A successful image composite is re-encoded to JPEG; a video keeps its container.
+  # If the overlay can't be applied we keep the raw original with ITS OWN extension,
+  # so the file's name always matches its real contents.
+  local omext="$lext"
+  [ "$kind" = "image" ] && omext="jpg"
+  local mout_ok="$mdir/$prefix.$omext"      # written on a successful merge
+  local mout_orig="$mdir/$prefix.$lext"     # written when keeping the original
+  if [ -f "$mout_ok" ] || [ -f "$mout_orig" ]; then echo "[skip] $prefix"; return 0; fi
 
-  if [ -z "$overlay" ]; then
-    cp "$main" "$tmp" && mv "$tmp" "$mout" || { rm -f "$tmp"; echo "[FAIL copy] $prefix"; return 1; }
-  elif [ "$kind" = "image" ]; then
-    "$FFMPEG" -nostdin -y -loglevel error -i "$main" -i "$overlay" \
-      -filter_complex "$SCALE[v]" -map "[v]" -frames:v 1 -q:v 2 "$tmp" \
-      && mv "$tmp" "$mout" || { rm -f "$tmp"; echo "[FAIL img] $prefix"; return 1; }
-  else
-    "$FFMPEG" -nostdin -y -loglevel error -i "$main" -i "$overlay" \
-      -filter_complex "$SCALE[v]" -map "[v]" -map "0:a?" -c:a copy \
-      -movflags +faststart "$tmp" \
-      && mv "$tmp" "$mout" || { rm -f "$tmp"; echo "[FAIL vid] $prefix"; return 1; }
+  if [ -n "$overlay" ]; then
+    # Scale the overlay to the base's exact pixel size, then composite it on top.
+    # The size is read explicitly with ffprobe: scale2ref proved non-deterministic
+    # with the WebP overlays Snapchat sometimes ships as ".png". No -loop is used,
+    # so a corrupt/undecodable overlay just yields no output instead of hanging.
+    local dim w h merged=1 tmp="$mout_ok.tmp.$omext"
+    dim="$(base_dims "$main")"; w="${dim%x*}"; h="${dim#*x}"
+    case "$dim" in
+      [0-9]*x[0-9]*)
+        if [ "$kind" = "image" ]; then
+          "$FFMPEG" -nostdin -y -loglevel error -i "$main" -i "$overlay" \
+            -filter_complex "[1:v]scale=$w:$h[ovl];[0:v][ovl]overlay=0:0[v]" \
+            -map "[v]" -frames:v 1 -q:v 2 "$tmp" 2>/dev/null && merged=0
+        else
+          "$FFMPEG" -nostdin -y -loglevel error -i "$main" -i "$overlay" \
+            -filter_complex "[1:v]scale=$w:$h[ovl];[0:v][ovl]overlay=0:0[v]" \
+            -map "[v]" -map "0:a?" -c:a copy -movflags +faststart "$tmp" 2>/dev/null && merged=0
+        fi
+      ;;
+    esac
+    if [ "$merged" -eq 0 ] && [ -s "$tmp" ]; then
+      mv "$tmp" "$mout_ok"; stamp "$mout_ok" "$year" "$month" "$day"
+      echo "[ok]   $year/$month/$prefix  (overlay merged)"
+      return 0
+    fi
+    # overlay could not be applied — keep the memory anyway (original, no overlay)
+    rm -f "$tmp"
+    echo "[warn] $year/$month/$prefix  (overlay unreadable, keeping original)"
   fi
-  stamp "$mout" "$year" "$month" "$day"
-  echo "[ok]   $year/$month/$prefix${overlay:+  (overlay merged)}"
+
+  local otmp="$mout_orig.tmp.$lext"
+  if cp "$main" "$otmp" && mv "$otmp" "$mout_orig"; then
+    stamp "$mout_orig" "$year" "$month" "$day"
+    echo "[ok]   $year/$month/$prefix"
+  else
+    rm -f "$otmp"; echo "[FAIL copy] $prefix"; return 1
+  fi
   return 0
 }
 
 # ---- 2. dispatch with a concurrency cap (bash 3.2 friendly) -------------
-LIST=$(mktemp /tmp/snap_list.XXXXXX)
+LIST="$WORK/main-list"
 find "$MEM" -type f -name '*-main.*' > "$LIST"
 TOTAL=$(grep -c . "$LIST")
 VIDS=$(grep -ciE '\-main\.(mp4|mov|m4v|avi)$' "$LIST")

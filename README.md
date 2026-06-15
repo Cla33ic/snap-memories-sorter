@@ -195,14 +195,17 @@ Each line the script printed means:
 | `[ok] 2023/05/...` | That memory was sorted successfully.                            |
 | `(overlay merged)` | A caption/sticker was put back onto that photo or video.        |
 | `[skip] ...`       | Already done in a previous run — left as-is.                    |
-| `[FAIL ...] ...`   | That one file couldn't be processed (the rest still continue).  |
+| `[warn] ...`       | The overlay couldn't be read (some are stored in odd formats), so the original is kept in Merged without it. |
+| `[FAIL orig] ...`  | That file couldn't be copied into Originals (the rest still continue). |
+| `[FAIL copy] ...`  | That file couldn't be copied into Merged either (the rest still continue). |
 
 ---
 
 ## Troubleshooting
 
-- **"ffmpeg not found"** — You skipped or didn't finish Step 2, *or* you didn't reopen the
-  terminal afterwards. Close it, open a new one, and run `ffmpeg -version` to confirm.
+- **"ffmpeg/ffprobe not found"** — You skipped or didn't finish Step 2, *or* you didn't
+  reopen the terminal afterwards. Close it, open a new one, and run `ffmpeg -version` to
+  confirm. (`ffprobe` is installed automatically together with `ffmpeg`.)
 - **"No .zip files found"** — You pointed the first picker at the wrong folder. It must be
   the folder that directly contains the `.zip` files from Snapchat.
 - **"No 'memories' folder found"** — Those ZIPs don't contain Memories. When requesting your

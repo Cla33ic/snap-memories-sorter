@@ -16,7 +16,8 @@
 
   Requirements:
     - Windows with Windows PowerShell 5.1+ (ships with Windows 10/11)
-    - ffmpeg on PATH  (https://www.gyan.dev/ffmpeg/builds/  or  winget install Gyan.FFmpeg)
+    - ffmpeg + ffprobe on PATH (ffprobe ships with ffmpeg)
+      https://www.gyan.dev/ffmpeg/builds/  or  winget install Gyan.FFmpeg
 
   Usage:  right-click the file -> "Run with PowerShell"
           or:  powershell -ExecutionPolicy Bypass -File .\snap-memories-sorter-windows.ps1
@@ -40,11 +41,11 @@ function Select-Folder([string]$Description) {
 
 Write-Host 'A dialog will ask for the folder that contains your Snapchat ZIP files...'
 $ZipDir = Select-Folder 'Select the folder that contains your Snapchat export ZIP files'
-if (-not $ZipDir) { Write-Error 'No source folder selected. Aborting.'; exit 1 }
+if (-not $ZipDir) { Write-Host 'No source folder selected. Aborting.'; exit 1 }
 
 Write-Host 'Now pick where the sorted memories should be saved...'
 $Base = Select-Folder 'Select the destination folder (Originals & Merged are created inside)'
-if (-not $Base) { Write-Error 'No destination folder selected. Aborting.'; exit 1 }
+if (-not $Base) { Write-Host 'No destination folder selected. Aborting.'; exit 1 }
 
 $Orig   = Join-Path $Base $SubOrig
 $Merged = Join-Path $Base $SubMerged
@@ -55,14 +56,19 @@ $Work = Join-Path ([System.IO.Path]::GetTempPath()) ("snap-merged-" + [System.Gu
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
 $Mem = Join-Path $Work 'memories'
 
-# ---- locate ffmpeg -------------------------------------------------------
-$ffmpegCmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
-$localFf   = Join-Path $PSScriptRoot 'ffmpeg.exe'
-if     ($ffmpegCmd)            { $Ffmpeg = $ffmpegCmd.Source }
-elseif (Test-Path $localFf)    { $Ffmpeg = $localFf }
-else {
+# ---- locate ffmpeg + ffprobe (ffprobe ships with ffmpeg) ----------------
+function Resolve-Tool([string]$Name) {
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $local = Join-Path $PSScriptRoot "$Name.exe"
+    if (Test-Path $local) { return $local }
+    return $null
+}
+$Ffmpeg  = Resolve-Tool 'ffmpeg'
+$Ffprobe = Resolve-Tool 'ffprobe'
+if (-not $Ffmpeg -or -not $Ffprobe) {
     Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
-    Write-Error 'ffmpeg not found. Install it (winget install Gyan.FFmpeg) and reopen PowerShell.'
+    Write-Host 'ffmpeg/ffprobe not found. Install ffmpeg (ffprobe is included): winget install Gyan.FFmpeg, then reopen PowerShell.'
     exit 1
 }
 
@@ -73,14 +79,23 @@ Write-Host "Output:   $Base\{$SubOrig,$SubMerged}\YYYY\MM"
 Write-Host "ffmpeg:   $Ffmpeg"
 Write-Host ''
 
-# scale2ref: stretch the overlay to the base frame, then composite at 0,0
-$Scale = '[1:v][0:v]scale2ref[ovl][bse];[bse][ovl]overlay=0:0'
-
 # ---- helpers -------------------------------------------------------------
 function Find-Overlay([string]$Dir, [string]$Prefix) {
     $hit = Get-ChildItem -LiteralPath $Dir -Filter "$Prefix-overlay.*" -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($hit) { return $hit.FullName }
     return $null
+}
+
+function Get-BaseDims([string]$Path) {  # returns @(w, h) or $null
+    try {
+        $d = & $Ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x $Path 2>$null
+        if ($d -match '^(\d+)x(\d+)') { return @($Matches[1], $Matches[2]) }
+    } catch { }
+    return $null
+}
+
+function Remove-Temp([string]$Path) {
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
 }
 
 function Set-Stamp([string]$Path, [string]$Year, [string]$Month, [string]$Day) {
@@ -124,49 +139,73 @@ function Process-One([string]$Main) {
     # --- Merged: as seen in Snapchat ---
     $mdir = Join-Path (Join-Path $Merged $year) $month
     New-Item -ItemType Directory -Force -Path $mdir | Out-Null
-    $moutext = $lext
-    if ($overlay -and $kind -eq 'image') { $moutext = 'jpg' }
-    $mout = Join-Path $mdir "$prefix.$moutext"
-    if (Test-Path -LiteralPath $mout) { Write-Host "[skip] $prefix"; return }
-    $tmp = "$mout.tmp.$moutext"
+    # A successful image composite is re-encoded to JPEG; a video keeps its container.
+    # If the overlay can't be applied we keep the raw original with ITS OWN extension,
+    # so the file's name always matches its real contents.
+    $omext = $lext
+    if ($kind -eq 'image') { $omext = 'jpg' }
+    $moutOk   = Join-Path $mdir "$prefix.$omext"   # written on a successful merge
+    $moutOrig = Join-Path $mdir "$prefix.$lext"    # written when keeping the original
+    if ((Test-Path -LiteralPath $moutOk) -or (Test-Path -LiteralPath $moutOrig)) { Write-Host "[skip] $prefix"; return }
 
+    if ($overlay) {
+        # Scale the overlay to the base's exact pixel size, then composite it on top.
+        # The size is read explicitly with ffprobe: scale2ref proved non-deterministic
+        # with the WebP overlays Snapchat sometimes ships as .png. No -loop is used,
+        # so a corrupt/undecodable overlay just yields no output instead of hanging.
+        $tmp = "$moutOk.tmp.$omext"
+        $dims = Get-BaseDims $Main
+        $merged = $false
+        if ($dims) {
+            $w = $dims[0]; $h = $dims[1]
+            $fc = "[1:v]scale=${w}:${h}[ovl];[0:v][ovl]overlay=0:0[v]"
+            try {
+                if ($kind -eq 'image') {
+                    & $Ffmpeg -nostdin -y -loglevel error -i $Main -i $overlay `
+                        -filter_complex $fc -map '[v]' -frames:v 1 -q:v 2 $tmp 2>$null
+                } else {
+                    & $Ffmpeg -nostdin -y -loglevel error -i $Main -i $overlay `
+                        -filter_complex $fc -map '[v]' -map '0:a?' -c:a copy `
+                        -movflags +faststart $tmp 2>$null
+                }
+                $merged = ($LASTEXITCODE -eq 0)
+            } catch { $merged = $false }
+        }
+        if ($merged -and (Test-Path -LiteralPath $tmp) -and (Get-Item -LiteralPath $tmp).Length -gt 0) {
+            Move-Item -LiteralPath $tmp -Destination $moutOk -Force
+            Set-Stamp $moutOk $year $month $day
+            Write-Host "[ok]   $year\$month\$prefix  (overlay merged)"
+            return
+        }
+        # overlay could not be applied — keep the memory anyway (original, no overlay)
+        Remove-Temp $tmp
+        Write-Host "[warn] $year\$month\$prefix  (overlay unreadable, keeping original)"
+    }
+
+    $otmp = "$moutOrig.tmp.$lext"
     try {
-        if (-not $overlay) {
-            Copy-Item -LiteralPath $Main -Destination $tmp -Force
-        }
-        elseif ($kind -eq 'image') {
-            & $Ffmpeg -nostdin -y -loglevel error -i $Main -i $overlay `
-                -filter_complex "$Scale[v]" -map '[v]' -frames:v 1 -q:v 2 $tmp
-            if ($LASTEXITCODE -ne 0) { throw "ffmpeg image failed" }
-        }
-        else {
-            & $Ffmpeg -nostdin -y -loglevel error -i $Main -i $overlay `
-                -filter_complex "$Scale[v]" -map '[v]' -map '0:a?' -c:a copy `
-                -movflags +faststart $tmp
-            if ($LASTEXITCODE -ne 0) { throw "ffmpeg video failed" }
-        }
-        Move-Item -LiteralPath $tmp -Destination $mout -Force
-        Set-Stamp $mout $year $month $day
-        $note = if ($overlay) { '  (overlay merged)' } else { '' }
-        Write-Host "[ok]   $year\$month\$prefix$note"
+        Copy-Item -LiteralPath $Main -Destination $otmp -Force
+        Move-Item -LiteralPath $otmp -Destination $moutOrig -Force
+        Set-Stamp $moutOrig $year $month $day
+        Write-Host "[ok]   $year\$month\$prefix"
     }
     catch {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-        Write-Host "[FAIL] $prefix"
+        Remove-Temp $otmp
+        Write-Host "[FAIL copy] $prefix"
     }
 }
 
 try {
     # ---- 1. extract all zips from the chosen folder ---------------------
     $zips = Get-ChildItem -LiteralPath $ZipDir -Filter '*.zip' -File
-    if (-not $zips) { Write-Error "No .zip files found in $ZipDir."; exit 1 }
+    if (-not $zips) { Write-Host "No .zip files found in $ZipDir."; exit 1 }
     foreach ($z in $zips) {
         Write-Host "extracting $($z.Name) ..."
         Expand-Archive -LiteralPath $z.FullName -DestinationPath $Work -Force
     }
     Write-Host "Extracted $($zips.Count) zip file(s)."
     if (-not (Test-Path -LiteralPath $Mem)) {
-        Write-Error "No 'memories' folder found inside the extracted data."; exit 1
+        Write-Host "No 'memories' folder found inside the extracted data."; exit 1
     }
     Write-Host ''
 
