@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Output / data — never commit personal memories or exports
+Originals/
+Merged/
+*.zip
+snap-merged*/
+
+# Bundled binaries
+ffmpeg
+ffmpeg.exe
